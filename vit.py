@@ -1,5 +1,6 @@
 import torch
-from torch import nn
+from torch import nn, pi
+import torch.nn.functional as F
 
 from einops import rearrange, repeat
 from einops.layers.torch import Rearrange
@@ -63,142 +64,94 @@ class Attention(nn.Module):
         return self.to_out(out)
 
 class Transformer(nn.Module):
-    def __init__(self, dim, depth, heads, dim_head, mlp_dim, dropout = 0.):
+    def __init__(self, dim, depth, heads, dim_head, mlp_dim, dim_cond=8, dropout = 0.):
         super().__init__()
         self.norm = nn.LayerNorm(dim)
         self.layers = nn.ModuleList([])
         for _ in range(depth):
+            cond_block = nn.Linear(dim_cond, dim, bias = False)
+            nn.init.zeros_(cond_block.weight)
             self.layers.append(nn.ModuleList([
                 Attention(dim, heads = heads, dim_head = dim_head, dropout = dropout),
-                FeedForward(dim, mlp_dim, dropout = dropout)
+                FeedForward(dim, mlp_dim, dropout = dropout),
+                cond_block
             ]))
-
-    def forward(self, x):
-        for attn, ff in self.layers:
+            
+    def forward(self, x, cond=None):
+        for attn, ff, cond_block in self.layers:
+            cx = 0
+            if cond is not None:
+                cx = cond_block(cond)
             x = attn(x) + x
-            x = ff(x) + x
+            x = ff(x) * (cx + 1.) + x
 
         return self.norm(x)
 
-class ViT(nn.Module):
-    def __init__(self, *, 
-                 image_size, 
-                 patch_size, 
-                 num_classes, 
-                 dim, 
-                 depth, 
-                 heads, 
-                 mlp_dim, 
-                 pool = 'cls', 
-                 channels = 3, 
-                 dim_head = 64, 
-                 dropout = 0., 
-                 emb_dropout = 0.):
+def divisible_by(num, den):
+    return (num % den) == 0
+
+class LearnedSinusoidalPosEmb(nn.Module):
+    def __init__(self, dim):
         super().__init__()
-        image_height, image_width = pair(image_size)
-        patch_height, patch_width = pair(patch_size)
+        assert divisible_by(dim, 2)
+        half_dim = dim // 2
+        self.weights = nn.Parameter(torch.randn(half_dim))
 
-        assert image_height % patch_height == 0 and image_width % patch_width == 0, 'Image dimensions must be divisible by the patch size.'
+    def forward(self, x):
+        x = rearrange(x, 'b -> b 1')
+        freqs = x * rearrange(self.weights, 'd -> 1 d') * 2 * pi
+        fouriered = torch.cat((freqs.sin(), freqs.cos()), dim = -1)
+        fouriered = torch.cat((x, fouriered), dim = -1)
+        return fouriered
 
-        num_patches = (image_height // patch_height) * (image_width // patch_width)
-        patch_dim = channels * patch_height * patch_width
-        assert pool in {'cls', 'mean'}, 'pool type must be either cls (cls token) or mean (mean pooling)'
-
-        self.to_patch_embedding = nn.Sequential(
-            Rearrange('b c (h p1) (w p2) -> b (h w) (p1 p2 c)', p1 = patch_height, p2 = patch_width),
-            nn.LayerNorm(patch_dim),
-            nn.Linear(patch_dim, dim),
-            nn.LayerNorm(dim),
-        )
-
-        self.pos_embedding = nn.Parameter(torch.randn(1, num_patches + 1, dim))
-        self.cls_token = nn.Parameter(torch.randn(1, 1, dim))
-        self.dropout = nn.Dropout(emb_dropout)
-
-        self.transformer = Transformer(dim, depth, heads, dim_head, mlp_dim, dropout)
-
-        self.pool = pool
-        self.to_latent = nn.Identity()
-
-        self.mlp_head = nn.Linear(dim, num_classes)
-
-    def forward(self, img, cond, seq, mask):
-        x = self.to_patch_embedding(img)
-        b, n, _ = x.shape
-
-        cls_tokens = repeat(self.cls_token, '1 1 d -> b 1 d', b = b)
-        x = torch.cat((cls_tokens, x), dim=1)
-        x += self.pos_embedding[:, :(n + 1)]
-        x = self.dropout(x)
-
-        x = self.transformer(x)
-
-        x = x.mean(dim = 1) if self.pool == 'mean' else x[:, 0]
-
-        x = self.to_latent(x)
-        return self.mlp_head(x)
-    
-
-class SpatialViT(nn.Module):
+class DenoiseViT(nn.Module):
     def __init__(self, *,  
-                 patch_size, 
-                 past_len,
-                 future_len,
-                 num_classes, 
+                 dim_cond,
+                 dim_input,
                  dim, 
                  depth, 
                  heads, 
                  mlp_dim, 
-                 channels = 3, 
                  dim_head = 64, 
                  dropout = 0., 
                  emb_dropout = 0.):
         super().__init__()
-        patch_height, patch_width = pair(patch_size)
-        patch_dim = channels * patch_height * patch_width
 
         self.to_patch_embedding = nn.Sequential(
-            nn.LayerNorm(patch_dim),
-            nn.Linear(patch_dim, dim),
+            nn.LayerNorm(dim_input),
+            nn.Linear(dim_input, dim),
             nn.LayerNorm(dim),
         )
 
-        self.pad_token = nn.Parameter(torch.randn(1, 1, dim))
-        self.start_token = nn.Parameter(torch.randn(1, 1, dim))
-        self.end_token = nn.Parameter(torch.randn(1, 1, dim))
-        self.to_latent = nn.Identity()
-        self.mlp_head = nn.Linear(dim, 2) # Predict end-of-image token
-
-        self.cond_embedding = nn.Embedding(num_embeddings=num_classes, embedding_dim=dim)
-
-        self.pos_embedding = nn.Parameter(torch.randn(1, past_len + future_len + 1, dim))
+        self.to_time_emb = nn.Sequential(
+            LearnedSinusoidalPosEmb(dim_cond),
+            nn.Linear(dim_cond + 1, dim),
+        )
         
         self.dropout = nn.Dropout(emb_dropout)
+        self.transformer = Transformer(dim, depth, heads, dim_head, mlp_dim, dim_cond, dropout)
 
-        self.transformer = Transformer(dim, depth, heads, dim_head, mlp_dim, dropout)
+        self.to_denoise = nn.Sequential(
+            nn.Linear(dim, mlp_dim),
+            nn.SiLU(),
+            nn.Dropout(dropout),
+            nn.Linear(mlp_dim, dim_input)
+        )
 
-
-    def forward(self, 
-                cond, 
-                seq, 
-                mask):
-        cond_emb = self.cond_embedding[cond]
-        x = self.to_patch_embedding(seq)
+    def forward(
+        self, 
+        noised,
+        times,
+        cond 
+    ):
         
+        x = self.to_patch_embedding(noised)
 
-        x = self.to_patch_embedding(img)
-        b, n, _ = x.shape
+        # time_emb = self.to_time_emb(times)
+        # x += time_emb
 
-        cls_tokens = repeat(self.cls_token, '1 1 d -> b 1 d', b = b)
-        x = torch.cat((cls_tokens, x), dim=1)
-        x += self.pos_embedding[:, :(n + 1)]
         x = self.dropout(x)
 
-        x = self.transformer(x)
+        x = self.transformer(x, cond = cond)
 
-        x = x.mean(dim = 1) if self.pool == 'mean' else x[:, 0]
-
-        x = self.to_latent(x)
-        p = self.mlp_head(x)
-
-        return x, p
+        return self.to_denoise(x)

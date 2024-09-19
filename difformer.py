@@ -19,6 +19,8 @@ from tqdm import tqdm
 
 from x_transformers import Decoder
 
+from vit import DenoiseViT
+
 # helpers
 
 def exists(v):
@@ -156,15 +158,13 @@ class MLP(Module):
 
         return denoised
 
-# gaussian diffusion
-
-class ElucidatedDiffusion(Module):
+class ArSpElucidatedDiffusion(Module):
     def __init__(
         self,
         dim: int,
         net: MLP,
         *,
-        num_sample_steps = 32, # number of sampling steps
+        sample_steps = 99,     # number of sampling steps
         sigma_min = 0.002,     # min noise level
         sigma_max = 80,        # max noise level
         sigma_data = 0.5,      # standard deviation of data distribution
@@ -193,7 +193,7 @@ class ElucidatedDiffusion(Module):
         self.P_mean = P_mean
         self.P_std = P_std
 
-        self.num_sample_steps = num_sample_steps  # otherwise known as N in the paper
+        self.sample_steps = sample_steps  # otherwise known as N in the paper
 
         self.S_churn = S_churn
         self.S_tmin = S_tmin
@@ -251,71 +251,79 @@ class ElucidatedDiffusion(Module):
     # sample schedule
     # equation (5) in the paper
 
-    def sample_schedule(self, num_sample_steps = None):
-        num_sample_steps = default(num_sample_steps, self.num_sample_steps)
+    def sample_schedule(self, sample_steps = None):
+        sample_steps = default(sample_steps, self.sample_steps)
 
-        N = num_sample_steps
+        N = sample_steps
         inv_rho = 1 / self.rho
 
-        steps = torch.arange(num_sample_steps, device = self.device, dtype = torch.float32)
+        steps = torch.arange(sample_steps, device = self.device, dtype = torch.float32)
         sigmas = (self.sigma_max ** inv_rho + steps / (N - 1) * (self.sigma_min ** inv_rho - self.sigma_max ** inv_rho)) ** self.rho
 
         sigmas = F.pad(sigmas, (0, 1), value = 0.) # last step is sigma value of 0.
-        return sigmas
+        return torch.flip(sigmas, [0])
+    
+    def sample_spatial_schedule(self, sample_steps = None):
+        sigmas = self.sample_schedule()
+        return torch.flip(sigmas, [0]).unsqueeze(0).repeat(3,1)
+    
+    def sample_spatial(self, t):
+        idx = repeat(torch.tensor([self.sample_steps]), '1 -> n', n=self.sample_steps)
+        s = torch.zeros(self.sample_steps)
+        b = torch.tensor(list(range(min(self.sample_steps, t), 0, -1)))
+        s[:min(self.sample_steps, t)] = b
+        return (idx - s).int()
 
     @torch.no_grad()
-    def sample(self, cond, num_sample_steps = None, clamp = None):
+    def sample(
+        self,
+        denoised_pred,
+        t,
+        cond, 
+        sample_steps = None, 
+        clamp = True
+    ):
         clamp = default(clamp, self.clamp_during_sampling)
-        num_sample_steps = default(num_sample_steps, self.num_sample_steps)
+        sample_steps = default(sample_steps, self.sample_steps)
 
-        shape = (cond.shape[0], self.dim)
+        shape = denoised_pred.shape
 
         # get the schedule, which is returned as (sigma, gamma) tuple, and pair up with the next sigma and gamma
 
-        sigmas = self.sample_schedule(num_sample_steps)
+        # Double check this is correct ---
+        sigmas = self.sample_schedule(sample_steps)
 
         gammas = torch.where(
             (sigmas >= self.S_tmin) & (sigmas <= self.S_tmax),
-            min(self.S_churn / num_sample_steps, sqrt(2) - 1),
+            min(self.S_churn / sample_steps, sqrt(2) - 1),
             0.
         )
 
-        sigmas_and_gammas = list(zip(sigmas[:-1], sigmas[1:], gammas[:-1]))
+        spatial = self.sample_spatial(t)
+        sigma = repeat(sigmas[spatial], "d -> b d 1", b = shape[0])
+        gamma = repeat(gammas[spatial], "d -> b d 1", b = shape[0])
+        sigma_next = sigma - 1
 
-        # images is noise at the beginning
+        eps = self.S_noise * torch.randn(shape, device = self.device) # stochastic sampling
+        sigma_hat = sigma + gamma * sigma
+        seq_hat = denoised_pred + torch.sqrt(sigma_hat ** 2 - sigma ** 2) * eps
+        # ---
 
-        init_sigma = sigmas[0]
+        model_output = self.preconditioned_network_forward(seq_hat, sigma_hat, cond = cond, clamp = clamp)
+        denoised_over_sigma = (seq_hat - model_output) / sigma_hat
+        seq = seq_hat + (sigma_next - sigma_hat) * denoised_over_sigma
 
-        seq = init_sigma * torch.randn(shape, device = self.device)
+        pred = seq[:,0,:]
 
-        # gradually denoise
-
-        for sigma, sigma_next, gamma in tqdm(sigmas_and_gammas, desc = 'sampling time step'):
-            sigma, sigma_next, gamma = map(lambda t: t.item(), (sigma, sigma_next, gamma))
-
-            eps = self.S_noise * torch.randn(shape, device = self.device) # stochastic sampling
-
-            sigma_hat = sigma + gamma * sigma
-            seq_hat = seq + sqrt(sigma_hat ** 2 - sigma ** 2) * eps
-
-            model_output = self.preconditioned_network_forward(seq_hat, sigma_hat, cond = cond, clamp = clamp)
-            denoised_over_sigma = (seq_hat - model_output) / sigma_hat
-
-            seq_next = seq_hat + (sigma_next - sigma_hat) * denoised_over_sigma
-
-            # second order correction, if not the last timestep
-
-            if sigma_next != 0:
-                model_output_next = self.preconditioned_network_forward(seq_next, sigma_next, cond = cond, clamp = clamp)
-                denoised_prime_over_sigma = (seq_next - model_output_next) / sigma_next
-                seq_next = seq_hat + 0.5 * (sigma_next - sigma_hat) * (denoised_over_sigma + denoised_prime_over_sigma)
-
-            seq = seq_next
+        # second order correction, if not the last timestep
+        model_output_next = self.preconditioned_network_forward(seq, sigma_next, cond = cond, clamp = clamp)
+        denoised_prime_over_sigma = (seq - model_output_next) / sigma_next
+        seq = seq_hat + 0.5 * (sigma_next - sigma_hat) * (denoised_over_sigma + denoised_prime_over_sigma)
 
         if clamp:
             seq = seq.clamp(-1., 1.)
 
-        return seq
+        return pred, seq
 
     # training
 
@@ -325,16 +333,13 @@ class ElucidatedDiffusion(Module):
     def noise_distribution(self, batch_size):
         return (self.P_mean + self.P_std * torch.randn((batch_size,), device = self.device)).exp()
 
-    def forward(self, seq, *, cond):
-        batch_size, dim, device = *seq.shape, self.device
-
-        assert dim == self.dim, f'dimension of sequence being passed in must be {self.dim} but received {dim}'
+    def forward(self, seq, cond):
+        batch_size, seq_len, dim, device = *seq.shape, self.device
 
         sigmas = self.noise_distribution(batch_size)
         padded_sigmas = right_pad_dims_to(seq, sigmas)
-
         noise = torch.randn_like(seq)
-
+        
         noised_seq = seq + padded_sigmas * noise  # alphas are 1. in the paper
 
         denoised = self.preconditioned_network_forward(noised_seq, sigmas, cond = cond)
@@ -346,19 +351,17 @@ class ElucidatedDiffusion(Module):
 
         return losses.mean()
 
-# main model, a decoder with continuous wrapper + small denoising mlp
-
-class AutoregressiveDiffusion(Module):
+class ArSpDiffusion(Module):
     def __init__(
         self,
         dim,
-        *,
-        max_seq_len,
+        num_classes,
+        window_size,
+        sample_steps,
+        sample_size,
         depth = 8,
         dim_head = 64,
         heads = 8,
-        mlp_depth = 3,
-        mlp_width = None,
         dim_input = None,
         decoder_kwargs: dict = dict(),
         mlp_kwargs: dict = dict(),
@@ -369,10 +372,14 @@ class AutoregressiveDiffusion(Module):
         super().__init__()
 
         self.start_token = nn.Parameter(torch.zeros(dim))
-        self.max_seq_len = max_seq_len
-        self.abs_pos_emb = nn.Embedding(max_seq_len, dim)
+        self.sample_size = sample_size
+        self.sample_steps = sample_steps
+        self.window_size = window_size
+
+        self.label_embedding = nn.Embedding(num_embeddings=num_classes, embedding_dim=dim)
 
         dim_input = default(dim_input, dim)
+        self.dim = dim
         self.dim_input = dim_input
         self.proj_in = nn.Linear(dim_input, dim)
 
@@ -384,17 +391,23 @@ class AutoregressiveDiffusion(Module):
             **decoder_kwargs
         )
 
-        self.denoiser = MLP(
+        # Using specialized ViT instead of MLP - to attend over future as well
+        self.denoiser = DenoiseViT(
             dim_cond = dim,
             dim_input = dim_input,
-            depth = mlp_depth,
-            width = default(mlp_width, dim),
+            dim = 256,
+            depth = 6,
+            heads = 12,
+            mlp_dim = 1024,
+            dropout = 0.1,
+            emb_dropout = 0.1,
             **mlp_kwargs
         )
 
-        self.diffusion = ElucidatedDiffusion(
+        self.diffusion = ArSpElucidatedDiffusion(
             dim_input,
             self.denoiser,
+            sample_steps=sample_steps,
             **diffusion_kwargs
         )
 
@@ -406,111 +419,133 @@ class AutoregressiveDiffusion(Module):
     def sample(
         self,
         batch_size = 1,
-        prompt  = None
+        label = 1
     ):
         self.eval()
 
-        start_tokens = repeat(self.start_token, 'd -> b 1 d', b = batch_size)
+        start_tokens = repeat(self.start_token, 'd -> b p d', b = batch_size, p=self.sample_steps)
 
-        if not exists(prompt):
-            out = torch.empty((batch_size, 0, self.dim_input), device = self.device, dtype = torch.float32)
-        else:
-            out = prompt
+        
+        out = torch.empty((batch_size, 0, self.dim_input), device = self.device, dtype = torch.float32)
+        cond = repeat(self.label_embedding(label), 'd -> b 1 d', b = batch_size)
 
         cache = None
+        
+        sigma_init = self.diffusion.sample_schedule(self.sample_steps)[0]
+        denoised_seq = sigma_init * torch.randn((batch_size, self.sample_steps, self.dim_input), device = self.device)
 
-        for _ in tqdm(range(self.max_seq_len - out.shape[1]), desc = 'tokens'):
-
-            cond = self.proj_in(out)
-
-            cond = torch.cat((start_tokens, cond), dim = 1)
-            cond = cond + self.abs_pos_emb(torch.arange(cond.shape[1], device = self.device))
+        for t in tqdm(range(self.sample_steps + self.sample_size), desc = 'tokens'):
+            
+            cond = torch.cat((start_tokens, cond), dim = 1)[:,-self.sample_steps:,:]
 
             cond, cache = self.transformer(cond, cache = cache, return_hiddens = True)
 
-            last_cond = cond[:, -1]
+            pred, denoised_seq = self.diffusion.sample(denoised_seq, t, cond = cond[:,-min(self.window_size, cond.shape[1]):, :])
+            
+            # first t steps are warmup
+            if t > self.sample_steps:
+                # add denoised center to out
+                pred = repeat(pred, 'b d -> b 1 d')
+                out = torch.cat((out, pred), dim = 1)
+                
+                # compute the next cond token
+                cond = self.proj_in(out)
 
-            denoised_pred = self.diffusion.sample(cond = last_cond)
-
-            denoised_pred = rearrange(denoised_pred, 'b d -> b 1 d')
-            out = torch.cat((out, denoised_pred), dim = 1)
+                # Add new rand sample to end
+                rand_sample = sigma_init * torch.randn((batch_size, 1, self.dim_input), device = self.device)
+                denoised_seq = torch.cat((denoised_seq[:,1:,:], rand_sample), dim = 1)
 
         return out
 
     def forward(
         self,
-        seq
+        seq,
+        label,
+        offset
     ):
         b, seq_len, dim = seq.shape
 
-        assert dim == self.dim_input
-        assert seq_len == self.max_seq_len
-
-        # break into seq and the continuous targets to be predicted
-
-        seq, target = seq[:, :-1], seq
-
         # append start tokens
+        cond = seq[:, (offset-self.sample_steps+2):offset, :]
+        target = seq[:, offset:(offset+self.sample_steps) , :]
 
-        seq = self.proj_in(seq)
+        cond = self.proj_in(cond)
         start_token = repeat(self.start_token, 'd -> b 1 d', b = b)
+        label_token  = repeat(self.label_embedding(label), '1 d -> b 1 d', b = b)
 
-        seq = torch.cat((start_token, seq), dim = 1)
-        seq = seq + self.abs_pos_emb(torch.arange(seq_len, device = self.device))
+        cond = torch.cat((start_token, label_token, cond), dim = 1)
 
-        cond = self.transformer(seq)
+        cond = self.transformer(cond)
 
-        # pack batch and sequence dimensions, so to train each token with different noise levels
-
-        target, _ = pack_one(target, '* d')
-        cond, _ = pack_one(cond, '* d')
-
+        # only look at previous window_size for past condition
         diffusion_loss = self.diffusion(target, cond = cond)
 
         return diffusion_loss
 
-# image wrapper
-
-def normalize_to_neg_one_to_one(img):
-    return img * 2 - 1
+def normalize_to_neg_one_to_one(patches):
+    return (patches / 255) * 2 - 1
 
 def unnormalize_to_zero_to_one(t):
-    return (t + 1) * 0.5
+    return (t + 1) * 0.5 
 
-class ImageAutoregressiveDiffusion(Module):
+class ArSpImageDiffusion(Module):
     def __init__(
         self,
         *,
-        image_size,
         patch_size,
+        num_classes,
+        window_size = 256,
+        sample_steps = 99,
+        sample_size = 500,
         channels = 3,
         model: dict = dict(),
     ):
         super().__init__()
-        assert divisible_by(image_size, patch_size)
 
-        num_patches = (image_size // patch_size) ** 2
         dim_in = channels * patch_size ** 2
 
-        self.image_size = image_size
-        self.patch_size = patch_size
+        self.pad_token = nn.Parameter(torch.randn(1, 1, dim_in))
+        self.start_token = nn.Parameter(torch.randn(1, 1, dim_in))
+        self.end_token = nn.Parameter(torch.randn(1, 1, dim_in))
 
-        self.to_tokens = Rearrange('b c (h p1) (w p2) -> b (h w) (c p1 p2)', p1 = patch_size, p2 = patch_size)
-
-        self.model = AutoregressiveDiffusion(
+        self.model = ArSpDiffusion(
             **model,
+            window_size = window_size,
+            sample_steps = sample_steps,
             dim_input = dim_in,
-            max_seq_len = num_patches
+            num_classes = num_classes,
+            sample_size = sample_size+1
         )
 
-        self.to_image = Rearrange('b (h w) (c p1 p2) -> b c (h p1) (w p2)', p1 = patch_size, p2 = patch_size, h = int(math.sqrt(num_patches)))
+        self.to_tokens = Rearrange('b (h p1) (w p2) c -> b (h w) (p1 p2 c)', p1 = patch_size, p2 = patch_size)
+        self.to_image = Rearrange('b (h w) (p1 p2 c) -> b (h p1) (w p2) c', p1 = patch_size, p2 = patch_size, h=int(sqrt(sample_size)))
 
-    def sample(self, batch_size = 1):
-        tokens = self.model.sample(batch_size = batch_size)
+
+    def sample(
+        self, 
+        batch_size = 1,
+        label = None,
+    ):
+        tokens = self.model.sample(label = label, batch_size = batch_size)
         images = self.to_image(tokens)
         return unnormalize_to_zero_to_one(images)
 
-    def forward(self, images):
-        images = normalize_to_neg_one_to_one(images)
-        tokens = self.to_tokens(images)
-        return self.model(tokens)
+    def forward(
+        self, 
+        img,
+        mask,
+        offset,
+        label
+    ):
+        patches = self.to_tokens(img)
+        patches = normalize_to_neg_one_to_one(patches)
+
+        patches_lookup = torch.concat([
+            self.pad_token,
+            self.start_token,
+            self.end_token,
+            patches
+        ], dim=1).squeeze()
+
+        tokens = patches_lookup[mask]
+        return self.model(tokens, label, offset)
