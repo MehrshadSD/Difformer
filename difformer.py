@@ -378,9 +378,9 @@ class ArSpDiffusion(Module):
     ):
         super().__init__()
 
-        self.pad_token = nn.Parameter(torch.randn(1, 1, dim))
-        self.start_token = nn.Parameter(torch.randn(1, 1, dim))
-        self.end_token = nn.Parameter(torch.randn(1, 1, dim))
+        self.pad_token = nn.Parameter(torch.randn(1, 1, dim_input))
+        self.start_token = nn.Parameter(torch.randn(1, 1, dim_input))
+        self.end_token = nn.Parameter(torch.randn(1, 1, dim_input))
 
         self.sample_size = sample_size
         self.sample_steps = sample_steps
@@ -449,8 +449,8 @@ class ArSpDiffusion(Module):
         for t in tqdm(range(self.sample_steps + self.sample_size), desc = 'tokens'):
             
             # no label for now
-            cond = self.proj_in(out)
-            cond = torch.cat((pad_tokens, start_tokens, cond), dim = 1)[:,-self.sample_steps:,:]
+            cond = torch.cat((pad_tokens, start_tokens, out), dim = 1)[:,-self.sample_steps:,:]
+            cond = self.proj_in(cond)
             
             cond, cache = self.transformer(cond, cache = cache, return_hiddens = True)
 
@@ -489,7 +489,7 @@ class ArSpDiffusion(Module):
 
         label_token  = repeat(self.label_embedding(label), 'b d -> b 1 d')
         # no label for now
-        cond = torch.cat((cond), dim = 1)
+        #cond = torch.cat((cond), dim = 1)
 
         cond = self.proj_in(cond)
         
