@@ -269,7 +269,7 @@ class ArSpElucidatedDiffusion(Module):
             t = torch.randint(self.sample_steps + self.sample_size, (1,))
         idx = repeat(torch.tensor([self.sample_steps]), '1 -> n', n=self.sample_steps)
         s = torch.zeros(self.sample_steps)
-        b = torch.tensor(list(range(min(self.sample_steps, t), 0, -1)))
+        b = torch.tensor(list(range(min(self.sample_steps, t)-1, -1, -1)))
         s[:min(self.sample_steps, t)] = b
         return (idx - s).int()
 
@@ -291,6 +291,7 @@ class ArSpElucidatedDiffusion(Module):
 
         # Double check this is correct ---
         sigmas = self.sample_schedule(sample_steps)
+    
 
         gammas = torch.where(
             (sigmas >= self.S_tmin) & (sigmas <= self.S_tmax),
@@ -299,9 +300,10 @@ class ArSpElucidatedDiffusion(Module):
         )
 
         spatial = self.sample_spatial(t)
+        spatial_next = spatial - 1
         sigma = repeat(sigmas[spatial], "d -> b d 1", b = shape[0])
+        sigma_next = repeat(sigmas[spatial_next], "d -> b d 1", b = shape[0])
         gamma = repeat(gammas[spatial], "d -> b d 1", b = shape[0])
-        sigma_next = sigma - 1
 
         eps = self.S_noise * torch.randn(shape, device = self.device) # stochastic sampling
         sigma_hat = sigma + gamma * sigma
@@ -315,9 +317,9 @@ class ArSpElucidatedDiffusion(Module):
         pred = seq[:,0,:]
 
         # second order correction, if not the last timestep
-        # model_output_next = self.preconditioned_network_forward(seq, sigma_next, cond = cond, clamp = clamp)
-        # denoised_prime_over_sigma = (seq - model_output_next) / sigma_next
-        # seq = seq_hat + 0.5 * (sigma_next - sigma_hat) * (denoised_over_sigma + denoised_prime_over_sigma)
+        model_output_next = self.preconditioned_network_forward(seq, sigma_next, cond = cond, clamp = clamp)
+        denoised_prime_over_sigma = (seq - model_output_next) / sigma_next
+        seq = seq_hat + 0.5 * (sigma_next - sigma_hat) * (denoised_over_sigma + denoised_prime_over_sigma)
 
         if clamp:
             seq = seq.clamp(-1., 1.)
@@ -443,7 +445,7 @@ class ArSpDiffusion(Module):
         cache = None
         
         sigma_init = self.diffusion.sample_schedule(self.sample_steps)[0]
-        denoised_seq = sigma_init * torch.randn((batch_size, self.sample_steps, self.dim_input), device = self.device)
+        denoised_seq = sigma_init * torch.randn((batch_size, self.sample_size, self.dim_input), device = self.device)
 
         for t in tqdm(range(self.sample_steps + self.sample_size), desc = 'tokens'):
             
@@ -453,14 +455,12 @@ class ArSpDiffusion(Module):
             cond, cache = self.transformer(cond, cache = cache, return_hiddens = True)
 
             pred, denoised_seq = self.diffusion.sample(denoised_seq, t, cond = cond)
-            print("h", t, pred)
+            
             # first t steps are warmup
-            if t > self.sample_steps:
+            if t >= self.sample_steps:
                 # add denoised center to out
                 pred = repeat(pred, 'b d -> b 1 d')
-                print("p", pred)
                 out = torch.cat((out, pred), dim = 1)
-                print("o", out)
 
                 # Add new rand sample to end
                 rand_sample = sigma_init * torch.randn((batch_size, 1, self.dim_input), device = self.device)
@@ -527,7 +527,7 @@ class ArSpImageDiffusion(Module):
             sample_steps = sample_steps,
             dim_input = dim_in,
             num_classes = num_classes,
-            sample_size = sample_size+1
+            sample_size = sample_size
         )
 
         self.to_tokens = Rearrange('b (h p1) (w p2) c -> b (h w) (p1 p2 c)', p1 = patch_size, p2 = patch_size)
