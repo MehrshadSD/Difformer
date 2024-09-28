@@ -42,7 +42,7 @@ import numpy as np
 PATCH_SIZE = 8
 SAMPLE_STEPS = 256
 WINDOW_SIZE = SAMPLE_STEPS
-SAMPLE_SIZE = 256
+SAMPLE_SIZE = 625
 data_path = "../data/jpg/image_00001.jpg"
 label_path = "../data/jpg/imagelabels.mat"
 device = "cuda"

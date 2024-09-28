@@ -311,13 +311,13 @@ class ArSpElucidatedDiffusion(Module):
 
         model_output = self.preconditioned_network_forward(seq_hat, sigma_hat, cond = cond, clamp = clamp)
         denoised_over_sigma = (seq_hat - model_output) / sigma_hat
-        seq = seq_hat + (sigma_next - sigma_hat) * denoised_over_sigma
+        seq_next = seq_hat + (sigma_next - sigma_hat) * denoised_over_sigma
 
-        pred = seq[:,0,:]
+        pred = seq_next[:,0,:]
 
         # second order correction, if not the last timestep
-        model_output_next = self.preconditioned_network_forward(seq, sigma_next, cond = cond, clamp = clamp)
-        denoised_prime_over_sigma = (seq - model_output_next) / sigma_next
+        model_output_next = self.preconditioned_network_forward(seq_next, sigma_next, cond = cond, clamp = clamp)
+        denoised_prime_over_sigma = (seq_next - model_output_next) / sigma_next
         seq = seq_hat + 0.5 * (sigma_next - sigma_hat) * (denoised_over_sigma + denoised_prime_over_sigma)
 
         if clamp:
@@ -378,9 +378,9 @@ class ArSpDiffusion(Module):
     ):
         super().__init__()
 
-        self.pad_token = nn.Parameter(torch.randn(1, 1, dim_input))
-        self.start_token = nn.Parameter(torch.randn(1, 1, dim_input))
-        self.end_token = nn.Parameter(torch.randn(1, 1, dim_input))
+        self.pad_token = nn.Parameter(torch.randn(1, 1, dim))
+        self.start_token = nn.Parameter(torch.randn(1, 1, dim))
+        self.end_token = nn.Parameter(torch.randn(1, 1, dim))
 
         self.sample_size = sample_size
         self.sample_steps = sample_steps
@@ -443,13 +443,14 @@ class ArSpDiffusion(Module):
         
         cache = None
         
-        sigma_init = self.diffusion.sample_schedule(self.sample_steps)[0]
+        sigma_init = self.diffusion.sample_schedule(self.sample_steps)[-1]
         denoised_seq = sigma_init * torch.randn((batch_size, self.sample_size, self.dim_input), device = self.device)
 
         for t in tqdm(range(self.sample_steps + self.sample_size), desc = 'tokens'):
             
-            cond = torch.cat((pad_tokens, start_tokens, out, label_tokens), dim = 1)[:,-self.sample_steps:,:]
-            cond = self.proj_in(cond)
+            # no label for now
+            cond = self.proj_in(out)
+            cond = torch.cat((pad_tokens, start_tokens, cond), dim = 1)[:,-self.sample_steps:,:]
             
             cond, cache = self.transformer(cond, cache = cache, return_hiddens = True)
 
@@ -478,7 +479,7 @@ class ArSpDiffusion(Module):
 
         # append start tokens
         cond = torch.stack([
-            s[(o-self.sample_steps+1):o, :] # +1 for label token
+            s[(o-self.sample_steps):o, :] # +1 for label token
             for s, o in zip(seq, offset)
         ])
         target = torch.stack([
@@ -487,7 +488,8 @@ class ArSpDiffusion(Module):
         ])
 
         label_token  = repeat(self.label_embedding(label), 'b d -> b 1 d')
-        cond = torch.cat((cond, label_token), dim = 1)
+        # no label for now
+        cond = torch.cat((cond), dim = 1)
 
         cond = self.proj_in(cond)
         
