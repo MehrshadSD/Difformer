@@ -30,7 +30,8 @@ class FeedForward(nn.Module):
 class Attention(nn.Module):
     def __init__(self, dim, heads = 8, dim_head = 64, dropout = 0.):
         super().__init__()
-        inner_dim = dim_head *  heads
+        self.dim = dim
+        self.inner_dim = dim_head *  heads
         project_out = not (heads == 1 and dim_head == dim)
 
         self.heads = heads
@@ -41,10 +42,10 @@ class Attention(nn.Module):
         self.attend = nn.Softmax(dim = -1)
         self.dropout = nn.Dropout(dropout)
 
-        self.to_qkv = nn.Linear(dim, inner_dim * 3, bias = False)
+        self.to_qkv = nn.Linear(dim, self.inner_dim * 3, bias = False)
 
         self.to_out = nn.Sequential(
-            nn.Linear(inner_dim, dim),
+            nn.Linear(self.inner_dim, dim),
             nn.Dropout(dropout)
         ) if project_out else nn.Identity()
 
@@ -61,10 +62,11 @@ class Attention(nn.Module):
 
         out = torch.matmul(attn, v)
         out = rearrange(out, 'b h n d -> b n (h d)')
+
         return self.to_out(out)
 
 class Transformer(nn.Module):
-    def __init__(self, dim, depth, heads, dim_head, mlp_dim, dim_cond=8, dropout = 0.):
+    def __init__(self, dim, depth, heads, dim_head, mlp_dim, dim_cond, dropout = 0.):
         super().__init__()
         self.norm = nn.LayerNorm(dim)
         self.layers = nn.ModuleList([])
@@ -83,7 +85,7 @@ class Transformer(nn.Module):
             if cond is not None:
                 cx = cond_block(cond)
             x = attn(x) + x
-            x = ff(x) * (cx + 1.) + x
+            x = (ff(x) + cx) * (cx + 1.) + x
 
         return self.norm(x)
 
@@ -98,8 +100,8 @@ class LearnedSinusoidalPosEmb(nn.Module):
         self.weights = nn.Parameter(torch.randn(half_dim))
 
     def forward(self, x):
-        x = rearrange(x, 'b -> b 1')
-        freqs = x * rearrange(self.weights, 'd -> 1 d') * 2 * pi
+        # x = rearrange(x, 'b s 1 -> b s 1')
+        freqs = x * rearrange(self.weights, 'd -> 1 1 d') * 2 * pi
         fouriered = torch.cat((freqs.sin(), freqs.cos()), dim = -1)
         fouriered = torch.cat((x, fouriered), dim = -1)
         return fouriered
@@ -144,14 +146,12 @@ class DenoiseViT(nn.Module):
         times,
         cond 
     ):
-        
         x = self.to_patch_embedding(noised)
 
-        # time_emb = self.to_time_emb(times)
-        # x += time_emb
+        time_emb = self.to_time_emb(times)
+        x += time_emb
 
         x = self.dropout(x)
-
         x = self.transformer(x, cond = cond)
 
         return self.to_denoise(x)

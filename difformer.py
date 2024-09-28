@@ -165,6 +165,7 @@ class ArSpElucidatedDiffusion(Module):
         net: MLP,
         *,
         sample_steps = 99,     # number of sampling steps
+        sample_size = 99,
         sigma_min = 0.002,     # min noise level
         sigma_max = 80,        # max noise level
         sigma_data = 0.5,      # standard deviation of data distribution
@@ -194,6 +195,7 @@ class ArSpElucidatedDiffusion(Module):
         self.P_std = P_std
 
         self.sample_steps = sample_steps  # otherwise known as N in the paper
+        self.sample_size = sample_size
 
         self.S_churn = S_churn
         self.S_tmin = S_tmin
@@ -228,18 +230,13 @@ class ArSpElucidatedDiffusion(Module):
 
         batch, device = noised_seq.shape[0], noised_seq.device
 
-        if isinstance(sigma, float):
-            sigma = torch.full((batch,), sigma, device = device)
-
-        padded_sigma = right_pad_dims_to(noised_seq, sigma)
-
         net_out = self.net(
-            self.c_in(padded_sigma) * noised_seq,
+            self.c_in(sigma) * noised_seq,
             times = self.c_noise(sigma),
             cond = cond
         )
 
-        out = self.c_skip(padded_sigma) * noised_seq +  self.c_out(padded_sigma) * net_out
+        out = self.c_skip(sigma) * noised_seq + self.c_out(sigma) * net_out
 
         if clamp:
             out = out.clamp(-1., 1.)
@@ -267,7 +264,9 @@ class ArSpElucidatedDiffusion(Module):
         sigmas = self.sample_schedule()
         return torch.flip(sigmas, [0]).unsqueeze(0).repeat(3,1)
     
-    def sample_spatial(self, t):
+    def sample_spatial(self, t=None):
+        if t == None:
+            t = torch.randint(self.sample_steps + self.sample_size, (1,))
         idx = repeat(torch.tensor([self.sample_steps]), '1 -> n', n=self.sample_steps)
         s = torch.zeros(self.sample_steps)
         b = torch.tensor(list(range(min(self.sample_steps, t), 0, -1)))
@@ -316,9 +315,9 @@ class ArSpElucidatedDiffusion(Module):
         pred = seq[:,0,:]
 
         # second order correction, if not the last timestep
-        model_output_next = self.preconditioned_network_forward(seq, sigma_next, cond = cond, clamp = clamp)
-        denoised_prime_over_sigma = (seq - model_output_next) / sigma_next
-        seq = seq_hat + 0.5 * (sigma_next - sigma_hat) * (denoised_over_sigma + denoised_prime_over_sigma)
+        # model_output_next = self.preconditioned_network_forward(seq, sigma_next, cond = cond, clamp = clamp)
+        # denoised_prime_over_sigma = (seq - model_output_next) / sigma_next
+        # seq = seq_hat + 0.5 * (sigma_next - sigma_hat) * (denoised_over_sigma + denoised_prime_over_sigma)
 
         if clamp:
             seq = seq.clamp(-1., 1.)
@@ -336,10 +335,17 @@ class ArSpElucidatedDiffusion(Module):
     def forward(self, seq, cond):
         batch_size, seq_len, dim, device = *seq.shape, self.device
 
+        # using noise distribution + future conditions
         sigmas = self.noise_distribution(batch_size)
         padded_sigmas = right_pad_dims_to(seq, sigmas)
+
+        sigmas =  self.sample_schedule() / self.S_churn
+        spatial = self.sample_spatial()
+        sigmas = repeat(sigmas[spatial], "s->1 s 1")
+
+        padded_sigmas = padded_sigmas * sigmas
         noise = torch.randn_like(seq)
-        
+
         noised_seq = seq + padded_sigmas * noise  # alphas are 1. in the paper
 
         denoised = self.preconditioned_network_forward(noised_seq, sigmas, cond = cond)
@@ -347,7 +353,7 @@ class ArSpElucidatedDiffusion(Module):
         losses = F.mse_loss(denoised, seq, reduction = 'none')
         losses = reduce(losses, 'b ... -> b', 'mean')
 
-        losses = losses * self.loss_weight(sigmas)
+        losses = losses #* self.loss_weight(sigmas)
 
         return losses.mean()
 
@@ -371,12 +377,15 @@ class ArSpDiffusion(Module):
     ):
         super().__init__()
 
-        self.start_token = nn.Parameter(torch.zeros(dim))
+        self.pad_token = nn.Parameter(torch.randn(1, 1, dim_input))
+        self.start_token = nn.Parameter(torch.randn(1, 1, dim_input))
+        self.end_token = nn.Parameter(torch.randn(1, 1, dim_input))
+
         self.sample_size = sample_size
         self.sample_steps = sample_steps
         self.window_size = window_size
 
-        self.label_embedding = nn.Embedding(num_embeddings=num_classes, embedding_dim=dim)
+        self.label_embedding = nn.Embedding(num_embeddings=num_classes, embedding_dim=dim_input)
 
         dim_input = default(dim_input, dim)
         self.dim = dim
@@ -396,8 +405,8 @@ class ArSpDiffusion(Module):
             dim_cond = dim,
             dim_input = dim_input,
             dim = 256,
-            depth = 6,
-            heads = 12,
+            depth = 8,
+            heads = 8,
             mlp_dim = 1024,
             dropout = 0.1,
             emb_dropout = 0.1,
@@ -408,6 +417,7 @@ class ArSpDiffusion(Module):
             dim_input,
             self.denoiser,
             sample_steps=sample_steps,
+            sample_size=sample_size,
             **diffusion_kwargs
         )
 
@@ -423,12 +433,13 @@ class ArSpDiffusion(Module):
     ):
         self.eval()
 
-        start_tokens = repeat(self.start_token, 'd -> b p d', b = batch_size, p=self.sample_steps)
+        pad_tokens = repeat(self.start_token, '1 1 d -> b s d', b = batch_size, s=self.sample_steps - 2)
+        start_tokens = repeat(self.start_token, '1 1 d -> b 1 d', b = batch_size)
+        label_tokens = repeat(self.label_embedding(label), 'd -> b 1 d', b = batch_size)
 
-        
+        cond = label_tokens
         out = torch.empty((batch_size, 0, self.dim_input), device = self.device, dtype = torch.float32)
-        cond = repeat(self.label_embedding(label), 'd -> b 1 d', b = batch_size)
-
+        
         cache = None
         
         sigma_init = self.diffusion.sample_schedule(self.sample_steps)[0]
@@ -436,20 +447,20 @@ class ArSpDiffusion(Module):
 
         for t in tqdm(range(self.sample_steps + self.sample_size), desc = 'tokens'):
             
-            cond = torch.cat((start_tokens, cond), dim = 1)[:,-self.sample_steps:,:]
-
+            cond = torch.cat((pad_tokens, start_tokens, out, label_tokens), dim = 1)[:,-self.sample_steps:,:]
+            cond = self.proj_in(cond)
+            
             cond, cache = self.transformer(cond, cache = cache, return_hiddens = True)
 
-            pred, denoised_seq = self.diffusion.sample(denoised_seq, t, cond = cond[:,-min(self.window_size, cond.shape[1]):, :])
-            
+            pred, denoised_seq = self.diffusion.sample(denoised_seq, t, cond = cond)
+            print("h", t, pred)
             # first t steps are warmup
             if t > self.sample_steps:
                 # add denoised center to out
                 pred = repeat(pred, 'b d -> b 1 d')
+                print("p", pred)
                 out = torch.cat((out, pred), dim = 1)
-                
-                # compute the next cond token
-                cond = self.proj_in(out)
+                print("o", out)
 
                 # Add new rand sample to end
                 rand_sample = sigma_init * torch.randn((batch_size, 1, self.dim_input), device = self.device)
@@ -463,18 +474,24 @@ class ArSpDiffusion(Module):
         label,
         offset
     ):
+
         b, seq_len, dim = seq.shape
 
         # append start tokens
-        cond = seq[:, (offset-self.sample_steps+2):offset, :]
-        target = seq[:, offset:(offset+self.sample_steps) , :]
+        cond = torch.stack([
+            s[(o-self.sample_steps+1):o, :] # +1 for label token
+            for s, o in zip(seq, offset)
+        ])
+        target = torch.stack([
+            s[o:(o+self.sample_steps) , :]
+            for s, o in zip(seq, offset)
+        ])
+
+        label_token  = repeat(self.label_embedding(label), 'b d -> b 1 d')
+        cond = torch.cat((cond, label_token), dim = 1)
 
         cond = self.proj_in(cond)
-        start_token = repeat(self.start_token, 'd -> b 1 d', b = b)
-        label_token  = repeat(self.label_embedding(label), '1 d -> b 1 d', b = b)
-
-        cond = torch.cat((start_token, label_token, cond), dim = 1)
-
+        
         cond = self.transformer(cond)
 
         # only look at previous window_size for past condition
@@ -486,7 +503,7 @@ def normalize_to_neg_one_to_one(patches):
     return (patches / 255) * 2 - 1
 
 def unnormalize_to_zero_to_one(t):
-    return (t + 1) * 0.5 
+    return ((t + 1) * 0.5 * 255).int()
 
 class ArSpImageDiffusion(Module):
     def __init__(
@@ -503,10 +520,6 @@ class ArSpImageDiffusion(Module):
         super().__init__()
 
         dim_in = channels * patch_size ** 2
-
-        self.pad_token = nn.Parameter(torch.randn(1, 1, dim_in))
-        self.start_token = nn.Parameter(torch.randn(1, 1, dim_in))
-        self.end_token = nn.Parameter(torch.randn(1, 1, dim_in))
 
         self.model = ArSpDiffusion(
             **model,
@@ -539,13 +552,17 @@ class ArSpImageDiffusion(Module):
     ):
         patches = self.to_tokens(img)
         patches = normalize_to_neg_one_to_one(patches)
-
+        
         patches_lookup = torch.concat([
-            self.pad_token,
-            self.start_token,
-            self.end_token,
+            repeat(self.model.pad_token, "1 1 d -> b 1 d", b=patches.shape[0]),
+            repeat(self.model.start_token, "1 1 d -> b 1 d", b=patches.shape[0]),
+            repeat(self.model.end_token, "1 1 d -> b 1 d", b=patches.shape[0]),
             patches
         ], dim=1).squeeze()
 
-        tokens = patches_lookup[mask]
+        tokens = torch.stack([
+            p[m]
+            for p, m in zip(patches_lookup, mask)
+        ])
+
         return self.model(tokens, label, offset)
