@@ -292,7 +292,6 @@ class ArSpElucidatedDiffusion(Module):
         # Double check this is correct ---
         sigmas = self.sample_schedule(sample_steps)
     
-
         gammas = torch.where(
             (sigmas >= self.S_tmin) & (sigmas <= self.S_tmax),
             min(self.S_churn / sample_steps, sqrt(2) - 1),
@@ -406,7 +405,7 @@ class ArSpDiffusion(Module):
         self.denoiser = DenoiseViT(
             dim_cond = dim,
             dim_input = dim_input,
-            dim = 256,
+            dim = 2048,
             depth = 8,
             heads = 8,
             mlp_dim = 1024,
@@ -455,7 +454,7 @@ class ArSpDiffusion(Module):
             cond, cache = self.transformer(cond, cache = cache, return_hiddens = True)
 
             pred, denoised_seq = self.diffusion.sample(denoised_seq, t, cond = cond)
-            
+
             # first t steps are warmup
             if t >= self.sample_steps:
                 # add denoised center to out
