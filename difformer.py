@@ -354,7 +354,7 @@ class ArSpElucidatedDiffusion(Module):
         losses = F.mse_loss(denoised, seq, reduction = 'none')
         losses = reduce(losses, 'b ... -> b', 'mean')
 
-        losses = losses #* self.loss_weight(sigmas)
+        losses = losses * self.loss_weight(sigmas)
 
         return losses.mean()
 
@@ -434,7 +434,7 @@ class ArSpDiffusion(Module):
     ):
         self.eval()
 
-        pad_tokens = repeat(self.start_token, '1 1 d -> b s d', b = batch_size, s=self.sample_steps - 2)
+        pad_tokens = repeat(self.start_token, '1 1 d -> b s d', b = batch_size, s=self.sample_steps - 1)
         start_tokens = repeat(self.start_token, '1 1 d -> b 1 d', b = batch_size)
         label_tokens = repeat(self.label_embedding(label), 'd -> b 1 d', b = batch_size)
 
@@ -444,7 +444,7 @@ class ArSpDiffusion(Module):
         cache = None
         
         sigma_init = self.diffusion.sample_schedule(self.sample_steps)[-1]
-        denoised_seq = sigma_init * torch.randn((batch_size, self.sample_size, self.dim_input), device = self.device)
+        denoised_seq = sigma_init * torch.randn((batch_size, self.sample_steps, self.dim_input), device = self.device)
 
         for t in tqdm(range(self.sample_steps + self.sample_size), desc = 'tokens'):
             
