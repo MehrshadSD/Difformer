@@ -47,6 +47,12 @@ data_path = "../data/jpg/image_00001.jpg"
 label_path = "../data/jpg/imagelabels.mat"
 device = "cuda"
 
+with Image.open(data_path) as im:
+    a = np.asarray(im)
+    print(a.shape)
+    b = Image.fromarray(a, mode="RGB")
+    b.save("./test.jpg")
+
 
 # %%
 # import os, sys
@@ -197,11 +203,12 @@ def train(model, dataloader, optimizer):
 # %%
 def inference(model, num_images):
     model.eval()
-    for l in range(101):
+    for l in range(10):
         for j in range(num_images):
             sampled = model.sample(batch_size = 1, label=torch.tensor(l).to(device))
-            img = Image.fromarray(sampled.squeeze().cpu().numpy(), 'RGB')
+            img = Image.fromarray(sampled.squeeze().cpu().numpy().astype(np.uint8), mode='RGB')
             img.save("./results/"+str(l)+"_"+str(j)+".jpg")
+        break
 
 
 # %%
