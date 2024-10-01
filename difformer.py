@@ -354,7 +354,7 @@ class ArSpElucidatedDiffusion(Module):
         losses = F.mse_loss(denoised, seq, reduction = 'none')
         losses = reduce(losses, 'b ... -> b', 'mean')
 
-        losses = losses * self.loss_weight(sigmas)
+        losses = losses #* self.loss_weight(sigmas)
 
         return losses.mean()
 
@@ -454,7 +454,9 @@ class ArSpDiffusion(Module):
             
             cond, cache = self.transformer(cond, cache = cache, return_hiddens = True)
 
-            pred, denoised_seq = self.diffusion.sample(denoised_seq, t, cond = cond)
+            last_cond = cond[:,-1,:]
+
+            pred, denoised_seq = self.diffusion.sample(denoised_seq, t, cond = last_cond)
 
             # first t steps are warmup
             if t >= self.sample_steps:
@@ -474,7 +476,6 @@ class ArSpDiffusion(Module):
         label,
         offset
     ):
-
         b, seq_len, dim = seq.shape
 
         # append start tokens
@@ -495,8 +496,10 @@ class ArSpDiffusion(Module):
         
         cond = self.transformer(cond)
 
+        last_cond = cond[:,-1,:]
+
         # only look at previous window_size for past condition
-        diffusion_loss = self.diffusion(target, cond = cond)
+        diffusion_loss = self.diffusion(target, cond = last_cond)
 
         return diffusion_loss
 
@@ -532,7 +535,7 @@ class ArSpImageDiffusion(Module):
         )
 
         self.to_tokens = Rearrange('b (h p1) (w p2) c -> b (h w) (p1 p2 c)', p1 = patch_size, p2 = patch_size)
-        self.to_image = Rearrange('b (h w) (p1 p2 c) -> b (h p1) (w p2) c', p1 = patch_size, p2 = patch_size, h=int(sqrt(sample_size)))
+        self.to_image = Rearrange('b (h w) (p1 p2 c) -> b (h p1) (w p2) c', p1 = patch_size, p2 = patch_size, h=int(sqrt(sample_size)), w=int(sqrt(sample_size)))
 
 
     def sample(
